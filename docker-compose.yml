@@ -1,0 +1,127 @@
+version: '3.8'
+
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.9.1
+  env_file:
+    - .env
+  environment:
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth'
+    AIRFLOW__EMAIL__EMAIL_BACKEND: airflow.utils.email.send_email_smtp
+    AIRFLOW__SMTP__SMTP_HOST: ${SMTP_HOST}
+    AIRFLOW__SMTP__SMTP_STARTTLS: 'true'
+    AIRFLOW__SMTP__SMTP_SSL: 'false'
+    AIRFLOW__SMTP__SMTP_PORT: ${SMTP_PORT}
+    AIRFLOW__SMTP__SMTP_USER: ${SMTP_USER}
+    AIRFLOW__SMTP__SMTP_PASSWORD: ${SMTP_PASSWORD}
+    AIRFLOW__SMTP__SMTP_MAIL_FROM: ${SMTP_USER}
+    PYTHONPATH: /opt/airflow
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./spark_jobs:/opt/airflow/spark_jobs
+    - ./data:/opt/airflow/data
+    - ./scripts:/opt/airflow/scripts
+    - spark-jars:/opt/spark_jars
+    - airflow-logs:/opt/airflow/logs
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+services:
+
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+    volumes:
+      - postgres-db:/var/lib/postgresql/data
+
+  # Downloads mssql-jdbc jar once into shared volume
+  jdbc-jar-downloader:
+    image: curlimages/curl:latest
+    volumes:
+      - spark-jars:/opt/spark_jars
+    command: >
+      sh -c "
+        if [ ! -f /opt/spark_jars/mssql-jdbc-12.6.1.jre11.jar ]; then
+          echo 'Downloading mssql-jdbc jar...';
+          curl -L -o /opt/spark_jars/mssql-jdbc-12.6.1.jre11.jar
+            'https://repo1.maven.org/maven2/com/microsoft/sqlserver/mssql-jdbc/12.6.1.jre11/mssql-jdbc-12.6.1.jre11.jar';
+          echo 'Done.';
+        else
+          echo 'Jar already present.';
+        fi
+      "
+    restart: "no"
+
+  airflow-init:
+    <<: *airflow-common
+    command: >
+      bash -c "
+        pip install pandas pyarrow tabulate --quiet &&
+        airflow db init &&
+        airflow users create
+          --username admin --firstname Admin --lastname User
+          --role Admin --email admin@example.com --password admin
+      "
+    restart: on-failure
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8080:8080"
+    restart: always
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    restart: always
+
+  spark-master:
+    image: bitnami/spark:3.5
+    env_file:
+      - .env
+    environment:
+      SPARK_MODE: master
+      SPARK_MASTER_HOST: spark-master
+    ports:
+      - "7077:7077"
+      - "8081:8080"
+    volumes:
+      - ./spark_jobs:/opt/spark_jobs
+      - ./data:/opt/data
+      - spark-jars:/opt/spark_jars
+    depends_on:
+      - jdbc-jar-downloader
+
+  spark-worker:
+    image: bitnami/spark:3.5
+    env_file:
+      - .env
+    environment:
+      SPARK_MODE: worker
+      SPARK_MASTER_URL: spark://spark-master:7077
+      SPARK_WORKER_MEMORY: 2G
+      SPARK_WORKER_CORES: 2
+    depends_on:
+      - spark-master
+    volumes:
+      - ./spark_jobs:/opt/spark_jobs
+      - ./data:/opt/data
+      - spark-jars:/opt/spark_jars
+
+volumes:
+  postgres-db:
+  airflow-logs:
+  spark-jars:
